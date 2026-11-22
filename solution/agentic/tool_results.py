@@ -9,7 +9,7 @@ from typing import Any
 from langchain_core.messages import BaseMessage, ToolMessage
 
 
-def _parse(content: Any) -> dict | None:
+def parse_tool_content(content: Any) -> dict | None:
     """MCP tool results arrive as a JSON string or as a list of text blocks holding JSON."""
     if isinstance(content, list):
         content = "".join(
@@ -30,7 +30,7 @@ def tool_results(messages: list[BaseMessage], tool_name: str) -> list[dict]:
     results = []
     for message in messages:
         if isinstance(message, ToolMessage) and message.name == tool_name:
-            payload = _parse(message.content)
+            payload = parse_tool_content(message.content)
             if payload is not None:
                 results.append(payload)
     return results

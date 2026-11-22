@@ -1,5 +1,6 @@
 import enum
 from sqlalchemy import (
+    CheckConstraint,
     Column,
     String,
     Text,
@@ -43,6 +44,7 @@ class User(Base):
 
     account = relationship("Account", back_populates="users")
     tickets = relationship("Ticket", back_populates="user")
+    memories = relationship("CustomerMemory", back_populates="user")
 
     __table_args__ = (
         UniqueConstraint('account_id', 'external_user_id', name='uq_user_external_per_account'),
@@ -123,21 +125,35 @@ class Knowledge(Base):
         return f"<Knowledge(article_id='{self.article_id}', title='{self.title}')>"
 
 
-# TODO (Rubric 4): Add persistent long-term memory tables (or use a LangGraph Store instead).
-#   Conversation history already lives in Ticket / TicketMessage. What is missing is cross-session memory.
-#
-# pseudocode:
-#   class CustomerMemory(Base):            # one row per remembered fact about a customer
-#       __tablename__ = "customer_memory"
-#       memory_id      primary key (uuid string)
-#       account_id     FK accounts.account_id
-#       user_id        FK users.user_id
-#       memory_type    one of {"resolved_issue", "preference"}   # constrain with Enum or CheckConstraint
-#       key / summary  short text, e.g. "login issue" or "preferred_channel"
-#       value / detail text, e.g. "password reset link sent" or "email"
-#       source_ticket_id  FK tickets.ticket_id (nullable)
-#       created_at / updated_at
-#       relationship back to User (add `memories` on User)
-#
-#   Also consider: TicketMetadata.status and main_issue_type are free-form strings.
-#   Decide the allowed values (e.g. open / resolved / escalated) and enforce them.
+class CustomerMemory(Base):
+    """Long-term memory about a customer, kept across tickets and conversations.
+
+    memory_type "resolved_issue": key = issue category, value = what the issue was and how it
+                                  was fixed, source_ticket_id = the ticket that was resolved.
+    memory_type "preference":     key = preference name (e.g. "language"), value = the choice.
+                                  There is one row per (user, preference key); saving again updates it.
+    """
+
+    __tablename__ = 'customer_memory'
+
+    memory_id = Column(String, primary_key=True)
+    account_id = Column(String, ForeignKey('accounts.account_id'), nullable=False)
+    user_id = Column(String, ForeignKey('users.user_id'), nullable=False)
+    memory_type = Column(String, nullable=False)
+    key = Column(String, nullable=False)
+    value = Column(Text, nullable=False)
+    source_ticket_id = Column(String, ForeignKey('tickets.ticket_id'))
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    user = relationship("User", back_populates="memories")
+
+    __table_args__ = (
+        CheckConstraint(
+            "memory_type IN ('resolved_issue', 'preference')",
+            name='ck_customer_memory_type',
+        ),
+    )
+
+    def __repr__(self):
+        return f"<CustomerMemory(user_id='{self.user_id}', type='{self.memory_type}', key='{self.key}')>"

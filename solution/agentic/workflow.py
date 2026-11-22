@@ -28,7 +28,7 @@ from agentic.agents.agent import build_llm
 from agentic.agents.registry import build_agents
 from agentic.agents.resolver_agent import KB_CONFIDENCE_THRESHOLD
 from agentic.mcp_servers.toolbox import McpToolbox
-from agentic.tool_results import ok_results
+from agentic.tool_results import ok_results, parse_tool_content
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
@@ -45,6 +45,10 @@ EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 # One graph run takes about two supersteps per step (hub + specialist).
 RECURSION_LIMIT = 60
+
+# A customer whose problem in the same category was resolved this many times before and has
+# come back again is sent to a human: the standard fix evidently does not last.
+REPEAT_ISSUE_THRESHOLD = 2
 
 
 # --------------------------------------------------------------------------- #
@@ -66,6 +70,8 @@ class TicketState(TypedDict, total=False):
     customer_name: str | None
     account_blocked: bool
     ticket_id: str | None  # UDA-Hub ticket id, from the create_ticket result
+    support_user_id: str | None  # UDA-Hub user id, from the create_ticket result
+    memory: dict | None  # recalled: resolved_issues, preferences, previous_tickets
     kb: dict | None  # found_answer, answer, article_titles, top_score
     escalation_reason: str | None
     escalated: bool
@@ -80,6 +86,11 @@ class IntakeExtraction(BaseModel):
     email: str | None
 
 
+class PreferenceExtraction(BaseModel):
+    preferred_contact: str | None
+    language: str | None
+
+
 class Confirmation(BaseModel):
     satisfied: Literal["yes", "no", "unclear"]
 
@@ -91,6 +102,8 @@ NEW_TICKET_STATE: dict = {
     "customer_name": None,
     "account_blocked": False,
     "ticket_id": None,
+    "support_user_id": None,
+    "memory": None,
     "kb": None,
     "escalation_reason": None,
     "escalated": False,
@@ -186,6 +199,8 @@ def route(state: TicketState) -> str:
         return "account_lookup"
     if not state.get("ticket_id"):
         return "create_ticket"
+    if state.get("memory") is None:
+        return "recall"
     reason = escalation_reason(state)
     # Some reasons are known before the knowledge base is searched (blocked account, customer
     # said the fix failed). Those escalate straight away and skip the search.
@@ -226,6 +241,31 @@ def _pick_ticket_id(messages: list[AnyMessage]) -> str | None:
 # --------------------------------------------------------------------------- #
 # The graph
 # --------------------------------------------------------------------------- #
+def _pick_support_user_id(messages: list[AnyMessage]) -> str | None:
+    """The UDA-Hub user id of the customer, from the create_ticket result."""
+    created = ok_results(messages, "create_ticket")
+    return created[0]["ticket"].get("user_id") if created else None
+
+
+def _memory_prompt(memory: dict | None) -> str:
+    """What is known about a returning customer, as text for the reply writer."""
+    if not memory:
+        return ""
+    lines = []
+    if memory.get("preferences"):
+        prefs = ", ".join(f"{k}: {v}" for k, v in memory["preferences"].items())
+        lines.append(f"Customer preferences: {prefs}. Follow them (for example reply in their language).")
+    if memory.get("resolved_issues"):
+        past = "; ".join(f"{m['key']}: {m['value']}" for m in memory["resolved_issues"][:3])
+        lines.append(
+            f"Earlier resolved issues: {past}. If one is clearly the same problem, say briefly "
+            "that you recognise it. Otherwise do not mention them."
+        )
+    if memory.get("previous_tickets"):
+        lines.append(f"They have contacted support {memory['previous_tickets']} time(s) before.")
+    return "\n".join(lines)
+
+
 def _guard(name: str, node):
     """If a node fails, log it and tell the customer to retry instead of crashing the turn."""
 
@@ -247,6 +287,7 @@ async def build_orchestrator(
     llm = build_llm(model)
     extract_intake = llm.with_structured_output(IntakeExtraction)
     judge_confirmation = llm.with_structured_output(Confirmation)
+    extract_preferences = llm.with_structured_output(PreferenceExtraction)
 
     async def run_service_desk(task: str) -> list[AnyMessage]:
         result = await agents["service_desk_agent"].ainvoke(task)
@@ -358,7 +399,95 @@ async def build_orchestrator(
         if not ticket_id:
             logger.error("service desk returned no ticket id")
             return {"reply": APOLOGY}
-        return {"ticket_id": ticket_id}
+        return {
+            "ticket_id": ticket_id,
+            "support_user_id": _pick_support_user_id(messages),
+        }
+
+    # -- long-term memory: recall (before the answer is worked out) ----------- #
+    async def recall(state: TicketState) -> dict:
+        memory: dict = {"resolved_issues": [], "preferences": {}, "previous_tickets": 0}
+        support_user_id = state.get("support_user_id")
+        updates: dict = {}
+        if support_user_id:
+            try:
+                recalled = parse_tool_content(
+                    await toolbox.tool("get_customer_memory").ainvoke(
+                        {"user_id": support_user_id, "max_results": 50}
+                    )
+                )
+                history = parse_tool_content(
+                    await toolbox.tool("get_ticket_history").ainvoke(
+                        {"user_id": support_user_id, "max_results": 10}
+                    )
+                )
+                for item in (recalled or {}).get("memories", []):
+                    if item["memory_type"] == "resolved_issue":
+                        memory["resolved_issues"].append(item)
+                    else:
+                        memory["preferences"][item["key"]] = item["value"]
+                memory["previous_tickets"] = sum(
+                    1
+                    for t in (history or {}).get("tickets", [])
+                    if t["ticket_id"] != state["ticket_id"]
+                )
+            except Exception:
+                logger.exception("recalling customer memory failed")  # the ticket carries on
+
+        category = (state.get("classification") or {}).get("category")
+        repeats = [m for m in memory["resolved_issues"] if m["key"] == category]
+        if len(repeats) >= REPEAT_ISSUE_THRESHOLD:
+            updates["escalation_reason"] = (
+                f"Recurring issue: this customer had {len(repeats)} earlier {category} "
+                "issues resolved and it came back."
+            )
+        return {"memory": memory, **updates}
+
+    # -- long-term memory: remember what was learned once the issue is resolved -- #
+    async def remember(state: TicketState, customer_text: str) -> None:
+        support_user_id, ticket_id = state.get("support_user_id"), state["ticket_id"]
+        if not support_user_id:
+            return
+        save = toolbox.tool("save_customer_memory")
+        category = (state.get("classification") or {}).get("category", "other")
+        kb = state.get("kb") or {}
+        fix = ", ".join(kb.get("article_titles") or []) or "standard steps"
+        issue = (state.get("intake") or {}).get("issue", "")
+        try:
+            await save.ainvoke(
+                {
+                    "user_id": support_user_id,
+                    "memory_type": "resolved_issue",
+                    "key": category,
+                    "value": f"{issue} (fixed with: {fix})"[:900],
+                    "ticket_id": ticket_id,
+                }
+            )
+            start = state.get("history_start", 0)
+            customer_lines = "\n".join(
+                str(m.content)
+                for m in state.get("messages", [])[start:]
+                if isinstance(m, HumanMessage)
+            )
+            found = await extract_preferences.ainvoke(
+                "Find stated preferences in what the customer wrote: how they want to be "
+                "contacted (preferred_contact, e.g. email, phone, chat) and the language they "
+                "want replies in (language). Use null when not stated. Do not guess.\n\n"
+                f"{customer_lines}\n{customer_text}"
+            )
+            for key, value in found.model_dump().items():
+                if value and value.strip():
+                    await save.ainvoke(
+                        {
+                            "user_id": support_user_id,
+                            "memory_type": "preference",
+                            "key": key,
+                            "value": value.strip(),
+                            "ticket_id": ticket_id,
+                        }
+                    )
+        except Exception:
+            logger.exception("saving customer memory failed")  # never blocks the reply
 
     # -- resolver (step 5) --------------------------------------------------- #
     async def resolve(state: TicketState) -> dict:
@@ -453,7 +582,8 @@ async def build_orchestrator(
             "You write the next message from the CultPass support assistant to a customer. "
             "Be warm and concise. Plain text only, no markdown headings or bold. "
             "Never invent steps, policies or promises.\n\n"
-            f"Customer first name: {name or 'unknown'}\n{situation}\n\nWrite the message."
+            f"Customer first name: {name or 'unknown'}\n"
+            f"{_memory_prompt(state.get('memory'))}\n{situation}\n\nWrite the message."
         )
         return {"reply": str(message.content).strip(), "phase": phase}
 
@@ -493,6 +623,7 @@ async def build_orchestrator(
                 for r in ok_results(messages, "update_ticket")
             ):
                 logger.warning("ticket status was not set to resolved")
+            await remember(state, customer_text)
             return {
                 "phase": "closed",
                 "reply": "I'm glad that fixed it! Your ticket is now closed. Have a wonderful day!",
@@ -544,6 +675,7 @@ async def build_orchestrator(
         "classify": classify,
         "account_lookup": account_lookup,
         "create_ticket": create_ticket,
+        "recall": recall,
         "resolve": resolve,
         "escalate": escalate,
         "respond": respond,

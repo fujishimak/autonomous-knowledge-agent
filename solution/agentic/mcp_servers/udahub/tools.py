@@ -15,6 +15,7 @@ from agentic.mcp_servers.common import (
 )
 from agentic.mcp_servers.udahub.knowledge_index import KnowledgeIndex
 from agentic.mcp_servers.udahub.repository import (
+    MemoryType,
     MessageRole,
     TicketStatus,
     UdaHubRepository,
@@ -229,6 +230,88 @@ def build_udahub_server(
         if not message:
             return fail(NOT_FOUND, "No ticket with that id.")
         return ok(message=jsonable(message))
+
+    # --- long-term memory --------------------------------------------------
+
+    @server.tool
+    @safe_tool
+    def get_customer_memory(
+        user_id: str, memory_type: MemoryType | None = None, max_results: int = 20
+    ) -> dict:
+        """Recall what is remembered about a customer from earlier tickets.
+
+        Args:
+            user_id: The UDA-Hub user id (not the CultPass id).
+            memory_type: Optional filter: "resolved_issue" or "preference". Omit for both.
+            max_results: How many memories to return, 1 to 50 (default 20).
+
+        Returns:
+            {"ok": True, "count": int, "memories": [{"memory_id", "memory_type", "key",
+             "value", "source_ticket_id", "created_at"}]}, newest first. For a
+            "resolved_issue", `key` is the issue category and `value` says how it was fixed.
+            For a "preference", `key` is the setting (e.g. "language") and `value` the choice.
+        """
+        user_id = require_text(user_id, "user_id")
+        max_results = require_int_range(max_results, "max_results", 1, 50)
+        rows = repository.get_customer_memories(user_id, memory_type, max_results)
+        memories = [
+            pick(
+                r,
+                "memory_id",
+                "memory_type",
+                "key",
+                "value",
+                "source_ticket_id",
+                "created_at",
+            )
+            for r in rows
+        ]
+        return ok(count=len(memories), memories=memories)
+
+    @server.tool
+    @safe_tool
+    def save_customer_memory(
+        user_id: str,
+        memory_type: MemoryType,
+        key: str,
+        value: str,
+        ticket_id: str | None = None,
+    ) -> dict:
+        """Remember something about a customer for future tickets.
+
+        Use "resolved_issue" after an issue was fixed (key = category, value = problem and fix).
+        Use "preference" for a stated choice such as language or preferred contact; saving the
+        same key again replaces the earlier value.
+
+        Args:
+            user_id: The UDA-Hub user id.
+            memory_type: "resolved_issue" or "preference".
+            key: Issue category, or preference name.
+            value: What to remember, in a short sentence.
+            ticket_id: The ticket this came from, if any.
+
+        Returns:
+            {"ok": True, "memory": {...}}, or {"ok": False, "error": "not_found" |
+            "invalid_input", ...}.
+        """
+        user_id = require_text(user_id, "user_id")
+        key = require_text(key, "key", max_length=100)
+        value = require_text(value, "value", max_length=1000)
+        ticket_id = require_text(ticket_id, "ticket_id") if ticket_id else None
+        memory = repository.save_customer_memory(user_id, memory_type, key, value, ticket_id)
+        if not memory:
+            return fail(NOT_FOUND, "No support user with that id.")
+        return ok(
+            memory=pick(
+                memory,
+                "memory_id",
+                "memory_type",
+                "key",
+                "value",
+                "source_ticket_id",
+                "created_at",
+            )
+        )
 
     # --- knowledge base ----------------------------------------------------
 

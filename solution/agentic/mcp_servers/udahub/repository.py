@@ -11,6 +11,9 @@ DEFAULT_ACCOUNT_ID = "cultpass"
 TicketStatus = Literal["open", "in_progress", "resolved", "escalated"]
 TICKET_STATUSES: tuple[str, ...] = get_args(TicketStatus)
 
+MemoryType = Literal["resolved_issue", "preference"]
+MEMORY_TYPES: tuple[str, ...] = get_args(MemoryType)
+
 MessageRole = Literal["user", "agent", "ai", "system"]
 MESSAGE_ROLES: tuple[str, ...] = get_args(MessageRole)
 
@@ -223,3 +226,67 @@ class UdaHubRepository:
                 "content": message.content,
                 "created_at": message.created_at,
             }
+
+    # LONG-TERM MEMORY
+
+    def save_customer_memory(
+        self,
+        user_id: str,
+        memory_type: str,
+        key: str,
+        value: str,
+        source_ticket_id: str | None = None,
+    ) -> dict:
+        """Remember something about a customer. Returns {} if the user does not exist.
+
+        A "preference" is stored once per key: saving it again updates the earlier value.
+        A "resolved_issue" always adds a new row.
+        """
+        if memory_type not in MEMORY_TYPES:
+            raise ValueError(f"memory_type must be one of {MEMORY_TYPES}, got {memory_type!r}")
+        with u.get_session(self.engine) as session:
+            user = session.get(udahub.User, user_id)
+            if user is None:
+                return {}
+            memory = None
+            if memory_type == "preference":
+                memory = session.execute(
+                    select(udahub.CustomerMemory).where(
+                        udahub.CustomerMemory.user_id == user_id,
+                        udahub.CustomerMemory.memory_type == "preference",
+                        udahub.CustomerMemory.key == key,
+                    )
+                ).scalars().first()
+            if memory is None:
+                memory = udahub.CustomerMemory(
+                    memory_id=str(uuid.uuid4()),
+                    account_id=user.account_id,
+                    user_id=user_id,
+                    memory_type=memory_type,
+                    key=key,
+                    value=value,
+                    source_ticket_id=source_ticket_id,
+                )
+                session.add(memory)
+            else:
+                memory.value = value
+                memory.source_ticket_id = source_ticket_id
+            session.flush()
+            session.refresh(memory)
+            return u.model_to_dict(memory)
+
+    def get_customer_memories(
+        self, user_id: str, memory_type: str | None = None, max_results: int = 20
+    ) -> list:
+        """A customer's memories, newest first, optionally of one type."""
+        with u.get_session(self.engine) as session:
+            stmt = select(udahub.CustomerMemory).where(
+                udahub.CustomerMemory.user_id == user_id
+            )
+            if memory_type is not None:
+                stmt = stmt.where(udahub.CustomerMemory.memory_type == memory_type)
+            stmt = stmt.order_by(
+                udahub.CustomerMemory.updated_at.desc(),
+                udahub.CustomerMemory.created_at.desc(),
+            ).limit(max_results)
+            return [u.model_to_dict(m) for m in session.execute(stmt).scalars().all()]

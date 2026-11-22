@@ -80,6 +80,10 @@ class McpToolbox:
     def tool_names(self) -> list[str]:
         return list(self._tools)
 
+    def tool(self, name: str) -> BaseTool:
+        """One tool by name, for plumbing the graph calls itself (not bound to an agent)."""
+        return self.for_agent([name])[0]
+
     def for_agent(self, names: list[str]) -> list[BaseTool]:
         """The tools with these names, in the given order. Unknown names raise KeyError."""
         if self._stack is None:
