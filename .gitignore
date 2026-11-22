@@ -1,0 +1,25 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Editor
+.vscode/
+.idea/
+
+# Generated databases. Rebuild them by running notebooks 01 and 02.
+*.db
+*.sqlite3
+
+# Logs
+logs/

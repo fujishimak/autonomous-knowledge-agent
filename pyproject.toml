@@ -1,0 +1,21 @@
+[project]
+name = "autonomous-knowledge-agent"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "fastmcp>=3,<4",
+    "httpx>=0.28.1",
+    "ipykernel>=6.30.0",
+    "langchain>=0.3.27",
+    "langchain-core>=0.3.72",
+    "langchain-mcp-adapters>=0.1.9",
+    "langchain-openai>=0.3.28",
+    "langgraph>=0.5.4",
+    "langgraph-supervisor>=0.0.28",
+    "python-dotenv>=1.1.1",
+    "sqlalchemy>=2.0.41",
+    "sqlite-vec>=0.1.9",
+]
+
+[dependency-groups]
+dev = ["pytest>=9.2.0"]
