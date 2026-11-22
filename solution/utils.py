@@ -72,13 +72,3 @@ async def chat_interface(agent: CompiledStateGraph, ticket_id: str):
             {"messages": [HumanMessage(content=user_input)]}, config=config
         )
         print("Assistant:", result["messages"][-1].content)
-
-
-# TODO (Rubric 5): Add a structured logging helper used by workflow.py, agents and tools.
-# pseudocode:
-#   def get_logger(name) -> logger writing JSON lines to logs/agent_events.jsonl (and optionally stdout)
-#   def log_event(logger, ticket_id, agent, event, **fields):
-#       drop or mask sensitive keys (email, api keys, raw message text)
-#       emit {"ts", "ticket_id", "agent", "event", ...fields}
-#   def summarize_logs(path) -> dict with counts of
-#       kb_resolved vs escalated, tool usage by name, routes by category

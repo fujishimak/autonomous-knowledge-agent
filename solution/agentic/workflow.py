@@ -8,7 +8,8 @@ Ids (user_id, ticket_id) always come from tool results, never from an agent's wo
 
 Conversation phases (state["phase"]) across the customer's turns:
     intake                 collecting the four intake answers
-    processing             classify -> find account -> create ticket -> resolve / escalate -> reply
+    processing             classify -> find account -> create ticket -> recall memory ->
+                           resolve / escalate -> reply
     awaiting_confirmation  the fix was sent, waiting for "did that work?"
     escalated              a human has the ticket; later messages are added to it
     closed                 resolved; a new message starts a new ticket
@@ -22,14 +23,17 @@ Use:
 
 import logging
 import re
+import time
 from typing import Annotated, Literal, TypedDict
 
 from agentic.agents.agent import build_llm
 from agentic.agents.registry import build_agents
 from agentic.agents.resolver_agent import KB_CONFIDENCE_THRESHOLD
 from agentic.mcp_servers.toolbox import McpToolbox
+from agentic.observability import bind_context, log_event, reset_context, tool_outcome
 from agentic.tool_results import ok_results, parse_tool_content
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage
+from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
@@ -74,6 +78,7 @@ class TicketState(TypedDict, total=False):
     memory: dict | None  # recalled: resolved_issues, preferences, previous_tickets
     kb: dict | None  # found_answer, answer, article_titles, top_score
     escalation_reason: str | None
+    escalation_code: str | None  # why, as a short code for the logs and metrics
     escalated: bool
     reply: str | None  # text waiting to be sent to the customer
 
@@ -106,6 +111,7 @@ NEW_TICKET_STATE: dict = {
     "memory": None,
     "kb": None,
     "escalation_reason": None,
+    "escalation_code": None,
     "escalated": False,
     "reply": None,
 }
@@ -177,6 +183,23 @@ def escalation_reason(state: TicketState) -> str | None:
             "The knowledge base has no confident answer "
             f"(best score {kb.get('top_score', 0.0):.2f}, threshold {KB_CONFIDENCE_THRESHOLD})."
         )
+    return None
+
+
+def escalation_code(state: TicketState) -> str | None:
+    """The short code for `escalation_reason`, used in logs and metrics."""
+    if state.get("escalation_code"):
+        return state["escalation_code"]
+    if state.get("escalation_reason"):
+        return "other"
+    if state.get("account_blocked"):
+        return "account_blocked"
+    classification = state.get("classification") or {}
+    if classification.get("urgency") == "high" and classification.get("complexity") == "complex":
+        return "urgent_complex"
+    kb = state.get("kb")
+    if kb is not None and not kb_is_confident(kb):
+        return "low_confidence"
     return None
 
 
@@ -266,17 +289,35 @@ def _memory_prompt(memory: dict | None) -> str:
     return "\n".join(lines)
 
 
-def _guard(name: str, node):
-    """If a node fails, log it and tell the customer to retry instead of crashing the turn."""
+def _traced(name: str, node, recover: bool = True, quiet: bool = False):
+    """Wrap a node: bind the log context, time it, and log how it ended.
 
-    async def guarded(state: TicketState) -> dict:
+    With `recover`, a failing node is logged and the customer is told to retry instead of the
+    whole turn crashing. `quiet` skips the per-run timing event (used for the hub).
+    """
+
+    async def traced(state: TicketState, config: RunnableConfig) -> dict:
+        thread_id = ((config or {}).get("configurable") or {}).get("thread_id")
+        token = bind_context(thread_id=thread_id, ticket_id=state.get("ticket_id"), node=name)
+        started = time.perf_counter()
         try:
-            return await node(state)
-        except Exception:
+            result = await node(state)
+        except Exception as exc:
             logger.exception("node %s failed", name)
+            log_event("node_failed", level="error", error_type=type(exc).__name__)
+            if not recover:
+                raise
             return {"reply": APOLOGY}
+        else:
+            if not quiet:
+                log_event(
+                    "node_completed", duration_ms=round((time.perf_counter() - started) * 1000)
+                )
+            return result
+        finally:
+            reset_context(token)
 
-    return guarded
+    return traced
 
 
 async def build_orchestrator(
@@ -288,6 +329,19 @@ async def build_orchestrator(
     extract_intake = llm.with_structured_output(IntakeExtraction)
     judge_confirmation = llm.with_structured_output(Confirmation)
     extract_preferences = llm.with_structured_output(PreferenceExtraction)
+
+    async def call_tool(name: str, args: dict) -> dict:
+        """Call an MCP tool directly (bookkeeping the graph does itself) and log the outcome."""
+        payload = parse_tool_content(await toolbox.tool(name).ainvoke(args)) or {}
+        outcome = tool_outcome(payload)
+        log_event(
+            "tool_call",
+            agent="orchestrator",
+            tool=name,
+            outcome=outcome,
+            error_code=None if outcome == "ok" else payload.get("error"),
+        )
+        return payload
 
     async def run_service_desk(task: str) -> list[AnyMessage]:
         result = await agents["service_desk_agent"].ainvoke(task)
@@ -304,7 +358,14 @@ async def build_orchestrator(
 
     # -- hub ---------------------------------------------------------------- #
     async def orchestrator(state: TicketState) -> dict:
-        return {}  # routing happens on the conditional edges, using `route`
+        # Routing happens on the conditional edges, using `route`. The hub records the choice.
+        log_event(
+            "routing_decision",
+            phase=state.get("phase") or "intake",
+            next=route(state),
+            escalated=bool(state.get("escalated")),
+        )
+        return {}
 
     # -- intake (diagram step 1) --------------------------------------------- #
     async def intake(state: TicketState) -> dict:
@@ -332,6 +393,7 @@ async def build_orchestrator(
                 intake_data[key] = value.strip()
 
         missing = missing_intake(intake_data)
+        log_event("intake_checked", missing=missing, complete=not missing, first_turn=first_turn)
         if missing:
             return {
                 **updates,
@@ -350,7 +412,9 @@ async def build_orchestrator(
             f"When it happened: {intake_data['when']}\n"
             f"What the customer was doing: {intake_data['activity']}"
         )
-        return {"classification": result["structured_response"].model_dump()}
+        classification = result["structured_response"].model_dump()
+        log_event("classified", **classification)
+        return {"classification": classification}
 
     # -- account ops (step 3) ------------------------------------------------ #
     async def account_lookup(state: TicketState) -> dict:
@@ -360,6 +424,11 @@ async def build_orchestrator(
             "whether the account is blocked."
         )
         found = ok_results(result["messages"], "lookup_user_by_email")
+        log_event(
+            "account_lookup",
+            found=bool(found),
+            blocked=bool(found and found[0]["user"]["is_blocked"]),
+        )
         if not found:
             # Unknown email: ask again (the intake step will ask only for the email)
             intake_data = {**state["intake"], "email": None}
@@ -399,6 +468,7 @@ async def build_orchestrator(
         if not ticket_id:
             logger.error("service desk returned no ticket id")
             return {"reply": APOLOGY}
+        log_event("ticket_created", ticket_id=ticket_id)
         return {
             "ticket_id": ticket_id,
             "support_user_id": _pick_support_user_id(messages),
@@ -411,24 +481,20 @@ async def build_orchestrator(
         updates: dict = {}
         if support_user_id:
             try:
-                recalled = parse_tool_content(
-                    await toolbox.tool("get_customer_memory").ainvoke(
-                        {"user_id": support_user_id, "max_results": 50}
-                    )
+                recalled = await call_tool(
+                    "get_customer_memory", {"user_id": support_user_id, "max_results": 50}
                 )
-                history = parse_tool_content(
-                    await toolbox.tool("get_ticket_history").ainvoke(
-                        {"user_id": support_user_id, "max_results": 10}
-                    )
+                history = await call_tool(
+                    "get_ticket_history", {"user_id": support_user_id, "max_results": 10}
                 )
-                for item in (recalled or {}).get("memories", []):
+                for item in recalled.get("memories", []):
                     if item["memory_type"] == "resolved_issue":
                         memory["resolved_issues"].append(item)
                     else:
                         memory["preferences"][item["key"]] = item["value"]
                 memory["previous_tickets"] = sum(
                     1
-                    for t in (history or {}).get("tickets", [])
+                    for t in history.get("tickets", [])
                     if t["ticket_id"] != state["ticket_id"]
                 )
             except Exception:
@@ -441,6 +507,14 @@ async def build_orchestrator(
                 f"Recurring issue: this customer had {len(repeats)} earlier {category} "
                 "issues resolved and it came back."
             )
+            updates["escalation_code"] = "repeat_issue"
+        log_event(
+            "memory_recalled",
+            resolved_issues=len(memory["resolved_issues"]),
+            preferences=len(memory["preferences"]),
+            previous_tickets=memory["previous_tickets"],
+            repeat_issue=bool(updates),
+        )
         return {"memory": memory, **updates}
 
     # -- long-term memory: remember what was learned once the issue is resolved -- #
@@ -448,21 +522,23 @@ async def build_orchestrator(
         support_user_id, ticket_id = state.get("support_user_id"), state["ticket_id"]
         if not support_user_id:
             return
-        save = toolbox.tool("save_customer_memory")
         category = (state.get("classification") or {}).get("category", "other")
         kb = state.get("kb") or {}
         fix = ", ".join(kb.get("article_titles") or []) or "standard steps"
         issue = (state.get("intake") or {}).get("issue", "")
+        saved = 0
         try:
-            await save.ainvoke(
+            result = await call_tool(
+                "save_customer_memory",
                 {
                     "user_id": support_user_id,
                     "memory_type": "resolved_issue",
                     "key": category,
                     "value": f"{issue} (fixed with: {fix})"[:900],
                     "ticket_id": ticket_id,
-                }
+                },
             )
+            saved += result.get("ok") is True
             start = state.get("history_start", 0)
             customer_lines = "\n".join(
                 str(m.content)
@@ -477,17 +553,20 @@ async def build_orchestrator(
             )
             for key, value in found.model_dump().items():
                 if value and value.strip():
-                    await save.ainvoke(
+                    result = await call_tool(
+                        "save_customer_memory",
                         {
                             "user_id": support_user_id,
                             "memory_type": "preference",
                             "key": key,
                             "value": value.strip(),
                             "ticket_id": ticket_id,
-                        }
+                        },
                     )
+                    saved += result.get("ok") is True
         except Exception:
             logger.exception("saving customer memory failed")  # never blocks the reply
+        log_event("memory_saved", saved=saved)
 
     # -- resolver (step 5) --------------------------------------------------- #
     async def resolve(state: TicketState) -> dict:
@@ -501,14 +580,20 @@ async def build_orchestrator(
         resolution = result["structured_response"]
         searches = ok_results(result["messages"], "get_knowledge_articles")
         top_score = max((s.get("top_score", 0.0) for s in searches), default=0.0)
-        return {
-            "kb": {
-                "found_answer": resolution.found_answer,
-                "answer": resolution.answer,
-                "article_titles": resolution.article_titles,
-                "top_score": top_score,
-            }
+        kb = {
+            "found_answer": resolution.found_answer,
+            "answer": resolution.answer,
+            "article_titles": resolution.article_titles,
+            "top_score": top_score,
         }
+        log_event(
+            "kb_retrieval",
+            top_score=round(top_score, 3),
+            found_answer=kb["found_answer"],
+            confident=kb_is_confident(kb),
+            articles_used=len(kb["article_titles"]),
+        )
+        return {"kb": kb}
 
     # -- escalation ----------------------------------------------------------- #
     async def escalate(state: TicketState) -> dict:
@@ -532,6 +617,7 @@ async def build_orchestrator(
         )
         if not ok_results(result["messages"], "escalate_to_human"):
             logger.error("escalate_to_human did not succeed")
+            log_event("escalation_failed", level="error", reason_code=escalation_code(state))
             return {"escalation_reason": reason, "reply": APOLOGY}
 
         status = await run_service_desk(
@@ -542,7 +628,9 @@ async def build_orchestrator(
             for r in ok_results(status, "update_ticket")
         ):
             logger.warning("ticket status was not set to escalated")
-        return {"escalated": True, "escalation_reason": reason}
+        code = escalation_code(state)
+        log_event("escalated", ticket_id=state["ticket_id"], reason_code=code)
+        return {"escalated": True, "escalation_reason": reason, "escalation_code": code}
 
     # -- compose the answer for the customer ---------------------------------- #
     async def respond(state: TicketState) -> dict:
@@ -585,6 +673,13 @@ async def build_orchestrator(
             f"Customer first name: {name or 'unknown'}\n"
             f"{_memory_prompt(state.get('memory'))}\n{situation}\n\nWrite the message."
         )
+        memory = state.get("memory") or {}
+        log_event(
+            "reply_composed",
+            outcome="escalated" if state.get("escalated") else "fix_offered",
+            has_fix=has_fix,
+            personalised=bool(memory.get("preferences") or memory.get("resolved_issues")),
+        )
         return {"reply": str(message.content).strip(), "phase": phase}
 
     # -- later turns ---------------------------------------------------------- #
@@ -611,6 +706,7 @@ async def build_orchestrator(
             "(unclear, for example a new question)?"
         )
         ticket_id = state["ticket_id"]
+        log_event("confirmation", verdict=verdict.satisfied)
         if verdict.satisfied == "yes":
             messages = await record_message(
                 ticket_id,
@@ -623,6 +719,12 @@ async def build_orchestrator(
                 for r in ok_results(messages, "update_ticket")
             ):
                 logger.warning("ticket status was not set to resolved")
+            log_event(
+                "ticket_resolved",
+                ticket_id=ticket_id,
+                category=(state.get("classification") or {}).get("category"),
+                resolved_via="knowledge_base",
+            )
             await remember(state, customer_text)
             return {
                 "phase": "closed",
@@ -633,6 +735,7 @@ async def build_orchestrator(
             return {
                 "phase": "processing",
                 "escalation_reason": "The customer says the suggested fix did not work.",
+                "escalation_code": "fix_failed",
                 "kb": {**(state.get("kb") or {}), "found_answer": False},
             }
         await record_message(ticket_id, "user", customer_text)
@@ -648,6 +751,7 @@ async def build_orchestrator(
 
     async def followup(state: TicketState) -> dict:
         await record_message(state["ticket_id"], "user", _last_customer_text(state))
+        log_event("followup_recorded", ticket_id=state["ticket_id"])
         return {
             "reply": (
                 f"Thank you. I've added that to your ticket ({state['ticket_id']}). "
@@ -667,6 +771,7 @@ async def build_orchestrator(
                 logger.exception(
                     "recording the reply failed"
                 )  # the customer still gets it
+        log_event("turn_completed", reply_length=len(reply), phase=state.get("phase"))
         return {"messages": [AIMessage(content=reply)], "reply": None}
 
     # -- wire it up ----------------------------------------------------------- #
@@ -683,11 +788,11 @@ async def build_orchestrator(
         "followup": followup,
     }
     graph = StateGraph(TicketState)
-    graph.add_node("orchestrator", orchestrator)
+    graph.add_node("orchestrator", _traced("orchestrator", orchestrator, recover=False, quiet=True))
     for name, node in specialists.items():
-        graph.add_node(name, _guard(name, node))
+        graph.add_node(name, _traced(name, node))
         graph.add_edge(name, "orchestrator")  # every spoke reports back to the hub
-    graph.add_node("deliver", deliver)
+    graph.add_node("deliver", _traced("deliver", deliver, recover=False))
     graph.add_edge(START, "orchestrator")
     graph.add_conditional_edges(
         "orchestrator", route, {name: name for name in [*specialists, "deliver"]}

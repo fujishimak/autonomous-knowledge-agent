@@ -28,6 +28,7 @@
 #       wrap in create_react_agent(...) or a plain node function that returns a state update
 #
 import os
+import time
 from typing import Sequence
 
 from dotenv import load_dotenv
@@ -36,6 +37,8 @@ from langchain_core.tools import BaseTool
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel
 from langgraph.prebuilt import create_react_agent
+
+from agentic.observability import log_event, log_tool_results
 
 load_dotenv()
 
@@ -112,8 +115,16 @@ class Agent:
 
         messages.append(("user", question))
 
-        # TODO (adapt): add logging of the agent name, tool calls and outcome (Rubric 5).
-        return await self.graph.ainvoke(input={"messages": messages}, config=config)
+        started = time.perf_counter()
+        result = await self.graph.ainvoke(input={"messages": messages}, config=config)
+        tool_calls = log_tool_results(self.name, result["messages"])
+        log_event(
+            "agent_run",
+            agent=self.name,
+            tool_calls=tool_calls,
+            duration_ms=round((time.perf_counter() - started) * 1000),
+        )
+        return result
 
     def get_agent_tools(self) -> list[str]:
         """Names of the tools bound to this agent."""
