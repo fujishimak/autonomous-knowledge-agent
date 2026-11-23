@@ -25,3 +25,7 @@ __pycache__/
 
 # Logs
 logs/
+
+# Misc
+PROJECT_RUBRIC.md
+
