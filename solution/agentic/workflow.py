@@ -383,7 +383,7 @@ async def build_orchestrator(
             "Extract details about the customer's support request from their messages. "
             "Use only what the customer wrote. Leave a field null when it was not stated. "
             "If the customer corrected a value, use the newest one.\n"
-            "issue: what is wrong, in a short phrase (null if they only said they need help). when: when it happened, as they said. "
+            "issue: what they need help with, a problem or a question, in a short phrase (null if they only said they need help). when: when it happened, as they said. "
             "activity: what they were doing when it happened. name: their name. email: their email.\n\n"
             + _transcript(messages[start:])
         )
