@@ -15,7 +15,8 @@ class EscalationAgent(Agent):
 
         1. Write a hand-off note for the human: the customer's problem, what was already tried or
            found, and why it is being escalated. Then up to 3 short recommendations for a quick fix.
-        2. Call escalate_to_human with the ticket_id and the note as the reason.
+        2. Call escalate_to_human exactly once, with the ticket_id and the note as the reason. When it
+           returns ok, never call it again: a second call would notify the human twice.
         3. Reply with the note and the tool's confirmation.
 
         You cannot change the ticket status; another agent does that.
