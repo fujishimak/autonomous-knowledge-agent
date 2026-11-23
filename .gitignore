@@ -13,9 +13,11 @@ __pycache__/
 # Jupyter
 .ipynb_checkpoints/
 
-# Editor
+# Editor and assistant tooling (local settings and absolute paths)
 .vscode/
 .idea/
+.kiro/
+.kirograph/
 
 # Generated databases. Rebuild them by running notebooks 01 and 02.
 *.db
